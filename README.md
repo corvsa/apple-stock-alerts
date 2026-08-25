@@ -82,6 +82,24 @@ known value in `state.json`. A notification fires only on an
 you already got notified about won't page you again every half hour — only
 a fresh transition does (e.g. it sells out and comes back later).
 
+## Why `curl_cffi` instead of plain `requests`
+
+Apple's fulfillment-messages endpoint sits behind Akamai bot-management,
+which fingerprints the TLS/HTTP2 handshake itself, not just headers. Plain
+`requests` (built on Python's `ssl`/urllib3) has a fingerprint that doesn't
+match any real browser, so Akamai blocks it outright — that shows up as
+`541 Server Error: Unknown`, and it happens the same way whether the script
+runs on GitHub Actions or on your own machine. `curl_cffi` wraps
+libcurl-impersonate, which replays an actual Chrome TLS fingerprint
+byte-for-byte, so the request passes as a real browser. The script also
+sends a `Referer` matching the real configurator page for each product,
+which Akamai's heuristics also look at.
+
+If you ever see `541` errors again after this fix, it likely means Apple
+changed something about their bot detection — check for a newer
+`curl_cffi` release (`pip install -U curl_cffi`) and/or bump
+`IMPERSONATE` in `check_stock.py` to a newer Chrome version string first.
+
 ## Caveats
 
 - This uses an undocumented Apple endpoint that isn't a public API — Apple

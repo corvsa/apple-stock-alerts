@@ -19,7 +19,17 @@ import sys
 import time
 from pathlib import Path
 
-import requests
+import requests  # only used for the ntfy notification POST
+
+# Apple's fulfillment-messages endpoint sits behind Akamai bot-management,
+# which fingerprints the TLS/HTTP2 handshake itself (JA3/JA4), not just
+# headers. Python's `requests` (built on urllib3/OpenSSL) has a fingerprint
+# that doesn't match any real browser, so Akamai blocks it outright -- that's
+# the "541 Server Error: Unknown" you'll see if you swap this back to
+# `requests.get(...)`. curl_cffi wraps libcurl-impersonate, which replays an
+# actual Chrome TLS fingerprint byte-for-byte, so the request passes as a
+# real browser. See requirements.txt.
+from curl_cffi import requests as cffi_requests
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -35,13 +45,22 @@ NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh/apple-stock-94402-alerts-
 
 STATE_FILE = Path(__file__).parent / "state.json"
 
-# Apple blocks requests without a browser-like User-Agent.
+# Which browser TLS fingerprint curl_cffi should impersonate.
+IMPERSONATE = "chrome124"
+
+# Realistic browser headers to layer on top of the TLS impersonation.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Origin": "https://www.apple.com",
 }
 
 FULFILLMENT_URL = "https://www.apple.com/shop/fulfillment-messages"
@@ -50,31 +69,40 @@ FULFILLMENT_URL = "https://www.apple.com/shop/fulfillment-messages"
 #   part_number: the value sent as parts.0
 #   options:     comma-separated BTO option codes sent as option.0 (None for
 #                standard, off-the-shelf SKUs that don't need them)
+#   referer:     the actual apple.com configurator page for this exact
+#                config -- Akamai treats a fulfillment-messages request
+#                without a matching Referer as more bot-like, so we send the
+#                real one for each product.
 PRODUCTS = [
     {
         "name": "Mac mini (M4 / 24GB / 512GB)",
         "part_number": "MCYT4LL/A",
         "options": None,
+        "referer": "https://www.apple.com/shop/buy-mac/mac-mini",
     },
     {
         "name": 'MacBook Air 15" Midnight (M5 / 24GB / 512GB)',
         "part_number": "RO_MBA_M5_15_INCH_MIDNIGHT_BET_BES_ULT_2026",
         "options": "065-CKQP,065-CLKK,065-CKN0,065-CKP0,065-CKNY,065-CKP1,065-CKN2,065-CKQW,065-CKMX,065-CKP2",
+        "referer": "https://www.apple.com/shop/buy-mac/macbook-air/15-inch-midnight-m5-chip-10-core-cpu-10-core-gpu-24gb-memory-512gb-storage",
     },
     {
         "name": 'MacBook Air 15" Silver (M5 / 24GB / 512GB)',
         "part_number": "RO_MBA_M5_15_INCH_SILVER_BET_BES_ULT_2026",
         "options": "065-CKQM,065-CLKK,065-CKN0,065-CKP0,065-CKNY,065-CKP1,065-CKN2,065-CKQT,065-CKMX,065-CKP2",
+        "referer": "https://www.apple.com/shop/buy-mac/macbook-air/15-inch-silver-m5-chip-10-core-cpu-10-core-gpu-24gb-memory-512gb-storage",
     },
     {
         "name": 'MacBook Air 15" Starlight (M5 / 24GB / 512GB)',
         "part_number": "RO_MBA_M5_15_INCH_STARLIGHT_BET_BES_ULT_2026",
         "options": "065-CKQN,065-CLKK,065-CKN0,065-CKP0,065-CKNY,065-CKP1,065-CKN2,065-CKQV,065-CKMX,065-CKP2",
+        "referer": "https://www.apple.com/shop/buy-mac/macbook-air/15-inch-starlight-m5-chip-10-core-cpu-10-core-gpu-24gb-memory-512gb-storage",
     },
     {
         "name": 'MacBook Air 15" Sky Blue (M5 / 24GB / 512GB)',
         "part_number": "RO_MBA_M5_15_INCH_SKY_BLUE_BET_BES_ULT_2026",
         "options": "065-CKQQ,065-CLKK,065-CKN0,065-CKP0,065-CKNY,065-CKP1,065-CKN2,065-CKQX,065-CKMX,065-CKP2",
+        "referer": "https://www.apple.com/shop/buy-mac/macbook-air/15-inch-sky-blue-m5-chip-10-core-cpu-10-core-gpu-24gb-memory-512gb-storage",
     },
 ]
 
@@ -100,7 +128,7 @@ def save_state(state):
 # Apple fulfillment-messages API
 # ---------------------------------------------------------------------------
 
-def fetch_availability(product):
+def fetch_availability(product, retries=3):
     params = {
         "fae": "true",
         "searchNearby": "true",
@@ -110,9 +138,33 @@ def fetch_availability(product):
     if product["options"]:
         params["option.0"] = product["options"]
 
-    resp = requests.get(FULFILLMENT_URL, params=params, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
+    headers = dict(HEADERS)
+    headers["Referer"] = product["referer"]
+
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = cffi_requests.get(
+                FULFILLMENT_URL,
+                params=params,
+                headers=headers,
+                impersonate=IMPERSONATE,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < retries:
+                wait = attempt * random.uniform(3, 6)
+                print(
+                    f"  attempt {attempt}/{retries} failed ({exc}); retrying in {wait:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+    else:
+        raise last_exc
 
     stores = (
         data.get("body", {})
