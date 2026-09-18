@@ -30,7 +30,7 @@ jobs:
       - name: Run stock check
         run: python check_stock.py
         env:
-          STOCK_ZIP: "94402"
+          STOCK_ZIP: "18052"
           NTFY_URL: "https://ntfy.sh/apple-stock-94402-alerts-2"
 
       - name: Commit updated state (if changed)
